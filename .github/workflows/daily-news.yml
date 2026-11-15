@@ -1,0 +1,38 @@
+name: Daily News Webpage
+
+on:
+  schedule:
+    # UTC 01:25 = 台灣時間每天上午 09:25 啟動，約 09:30 完成網頁更新
+    - cron: '25 1 * * *'
+  workflow_dispatch: # 支援手動按鈕立即執行
+
+permissions:
+  contents: write
+
+jobs:
+  update-news:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Google GenAI SDK
+        run: pip install google-genai
+
+      - name: Run Daily News Generator
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python generate_news.py
+
+      - name: Commit and Push updated index.html
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add index.html
+          git commit -m "Auto update daily news" || exit 0
+          git push
