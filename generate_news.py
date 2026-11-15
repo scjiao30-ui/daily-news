@@ -88,7 +88,7 @@ def generate_daily_news():
 
     # 啟用 Google Search 即時搜尋工具
     response = client.models.generate_content(
-        model="gemini-2.5-flash",
+        model="gemini-3.8-flash",,
         contents=prompt,
         config=types.GenerateContentConfig(
             tools=[types.Tool(google_search=types.GoogleSearch())]
