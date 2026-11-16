@@ -5,67 +5,149 @@ import urllib.request
 import urllib.parse
 import xml.etree.ElementTree as ET
 import re
+from concurrent.futures import ThreadPoolExecutor
+from email.utils import parsedate_to_datetime
+from html import escape, unescape
+from html.parser import HTMLParser
 
-# 從新聞網頁或 Google News 抓取配圖與摘要
-def fetch_google_news_rss(query, max_items=5):
-    encoded_q = urllib.parse.quote(query)
-    url = f"https://news.google.com/rss/search?q={encoded_q}+when:1d&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+TAIPEI = datetime.timezone(datetime.timedelta(hours=8))
+NEWS_WINDOW = datetime.timedelta(hours=48)
+MEDIA_RSS = "{http://search.yahoo.com/mrss/}"
+
+
+def image_url(value, base):
+    if not value:
+        return ""
+    url = urllib.parse.urljoin(base, value.strip())
+    parsed = urllib.parse.urlsplit(url)
+    return url if parsed.scheme in {"http", "https"} and parsed.hostname else ""
+
+
+def rss_image(item, link):
+    for name in ("content", "thumbnail"):
+        for media in item.iter(f"{MEDIA_RSS}{name}"):
+            if media.get("medium") not in (None, "image"):
+                continue
+            if media.get("type") and not media.get("type").startswith("image/"):
+                continue
+            url = image_url(media.get("url"), link)
+            if url:
+                return url
+    for enclosure in item.findall("enclosure"):
+        if enclosure.get("type", "").startswith("image/"):
+            url = image_url(enclosure.get("url"), link)
+            if url:
+                return url
+    return ""
+
+
+def fetch_rss(url, now, max_items, source_name=None):
     items = []
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            xml_data = resp.read()
-        root = ET.fromstring(xml_data)
-        for item in root.findall("./channel/item")[:max_items]:
-            full_title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            source_el = item.find("source")
-            source_name = source_el.text.strip() if source_el is not None and source_el.text else "新聞來源"
-            # 分離標題與媒體名稱
-            title = full_title.rsplit(" - ", 1)[0] if " - " in full_title else full_title
-            desc_raw = item.findtext("description", "")
-            desc_clean = re.sub(r"<[^>]+>", " ", desc_raw)
-            desc_clean = re.sub(r"\s+", " ", desc_clean).strip()
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=12) as response:
+            root = ET.fromstring(response.read())
+        for entry in root.findall("./channel/item"):
+            try:
+                published = parsedate_to_datetime(entry.findtext("pubDate", ""))
+                if published.tzinfo is None:
+                    continue
+            except (ValueError, TypeError, OverflowError):
+                continue
+            if not now - NEWS_WINDOW <= published <= now:
+                continue
+            title = entry.findtext("title", "").strip()
+            link = image_url(entry.findtext("link", ""), url)
+            if not title or not link:
+                continue
+            description = entry.findtext("description", "")
+            description = unescape(re.sub(r"<[^>]+>", " ", description))
+            description = " ".join(description.split())
+            source = source_name or entry.findtext("source", "").strip() or "新聞來源"
+            if not source_name:
+                suffix = f" - {source}"
+                if title.endswith(suffix):
+                    title = title[:-len(suffix)]
             items.append({
                 "title": title,
-                "content": desc_clean if desc_clean and desc_clean != title else f"點擊下方來源連結閱讀「{title}」完整報導。",
-                "source_name": source_name,
+                "content": description[:160] + ("…" if len(description) > 160 else ""),
+                "source_name": source,
                 "source_url": link,
-                "image_url": ""
+                "image_url": rss_image(entry, link),
+                "published_at": published.isoformat(),
             })
-    except Exception as e:
-        print(f"RSS fetch warning for {query}: {e}")
-    return items
+    except (OSError, ValueError, ET.ParseError) as error:
+        print(f"RSS fetch warning for {url}: {error}")
+    return select_news(items, max_items)
 
-# 抓取 Yahoo 奇摩股市新聞（自帶高畫質新聞原圖）
-def fetch_yahoo_news_with_images(rss_url, max_items=4):
-    items = []
+
+def select_news(items, max_items):
+    ordered = sorted(
+        items, key=lambda item: datetime.datetime.fromisoformat(item["published_at"]),
+        reverse=True,
+    )
+    selected = []
+    seen_titles = set()
+    seen_links = set()
+    for item in ordered:
+        if item["title"] in seen_titles or item["source_url"] in seen_links:
+            continue
+        seen_titles.add(item["title"])
+        seen_links.add(item["source_url"])
+        selected.append(item)
+        if len(selected) == max_items:
+            break
+    return selected
+
+
+def fetch_google_news_rss(query, now, max_items=5):
+    encoded_q = urllib.parse.quote(f"{query} when:2d")
+    url = f"https://news.google.com/rss/search?q={encoded_q}&hl=zh-TW&gl=TW&ceid=TW:zh-Hant"
+    return fetch_rss(url, now, max_items)
+
+
+def fetch_yahoo_news_with_images(url, now, max_items=4):
+    return fetch_rss(url, now, max_items, source_name="Yahoo奇摩財經")
+
+
+class PreviewImageParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.images = {}
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "meta":
+            attributes = dict(attrs)
+            name = (attributes.get("property") or attributes.get("name") or "").lower()
+            if name in {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}:
+                self.images.setdefault(name, attributes.get("content"))
+
+
+def add_preview_image(item):
+    if item["image_url"]:
+        return
     try:
-        req = urllib.request.Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=12) as resp:
-            xml_data = resp.read()
-        root = ET.fromstring(xml_data)
-        for item in root.findall("./channel/item")[:max_items]:
-            title = item.findtext("title", "").strip()
-            link = item.findtext("link", "").strip()
-            desc = re.sub(r"<[^>]+>", "", item.findtext("description", "")).strip()
-            img_url = ""
-            media = item.find("{http://search.yahoo.com/mrss/}content")
-            if media is not None and media.attrib.get("url"):
-                img_url = media.attrib.get("url")
-            items.append({
-                "title": title,
-                "content": desc[:160] + ("..." if len(desc) > 160 else ""),
-                "source_name": "Yahoo奇摩財經",
-                "source_url": link,
-                "image_url": img_url
-            })
-    except Exception as e:
-        print(f"Yahoo RSS warning: {e}")
-    return items
+        request = urllib.request.Request(item["source_url"], headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=5) as response:
+            if response.headers.get_content_type() != "text/html":
+                return
+            page_url = response.geturl()
+            html = response.read(192 * 1024).decode(
+                response.headers.get_content_charset() or "utf-8", errors="replace"
+            )
+        parser = PreviewImageParser()
+        parser.feed(html)
+        for name in ("og:image:secure_url", "og:image", "twitter:image", "twitter:image:src"):
+            url = image_url(parser.images.get(name), page_url)
+            if url and urllib.parse.urlsplit(page_url).hostname != "news.google.com":
+                item["image_url"] = url
+                return
+    except (OSError, ValueError, LookupError):
+        pass
+
 
 # 抓取台灣證交所最新收盤價，自動結合個股最新新聞
-def fetch_focus_stocks():
+def fetch_focus_stocks(now):
     twse_map = {}
     try:
         req = urllib.request.Request(
@@ -96,7 +178,7 @@ def fetch_focus_stocks():
 
     stock_cards = []
     for code, name in base_codes:
-        news_list = fetch_google_news_rss(f"{code} {name} 營收 OR 法人 OR 財報", max_items=2)
+        news_list = fetch_google_news_rss(f"{code} {name} 營收 OR 法人 OR 財報", now, max_items=2)
         price_str = ""
         if code in twse_map:
             c_info = twse_map[code]
@@ -108,7 +190,9 @@ def fetch_focus_stocks():
                 "code_and_name": f"{code} {name}",
                 "content": f"{price_str}{top_n['title']}{second_title}。",
                 "source_name": top_n["source_name"],
-                "source_url": top_n["source_url"]
+                "source_url": top_n["source_url"],
+                "image_url": top_n["image_url"],
+                "published_at": top_n["published_at"]
             })
         else:
             stock_cards.append({
@@ -135,7 +219,22 @@ def try_gemini_polish(raw_data, today_str):
             try:
                 resp = client.models.generate_content(model=model_name, contents=prompt)
                 txt = re.sub(r"^```json\s*|\s*```$", "", resp.text.strip())
-                return json.loads(txt)
+                polished = json.loads(txt)
+                for section in ("industry", "market_overview", "focus_stocks", "politics"):
+                    original_items = raw_data[section]
+                    revised_items = polished[section]
+                    if len(original_items) != len(revised_items):
+                        raise ValueError(f"Changed number of items in {section}")
+                    for original, revised in zip(original_items, revised_items):
+                        if revised.get("source_url") != original["source_url"]:
+                            raise ValueError(f"Changed source or order in {section}")
+                        content = revised.get("content")
+                        if not isinstance(content, str) or not content.strip():
+                            raise ValueError(f"Missing summary in {section}")
+                for section in ("industry", "market_overview", "politics"):
+                    for original, revised in zip(raw_data[section], polished[section]):
+                        original["content"] = revised["content"]
+                return raw_data
             except Exception as inner_e:
                 print(f"Model {model_name} skipped: {inner_e}")
     except Exception as e:
@@ -143,66 +242,90 @@ def try_gemini_polish(raw_data, today_str):
     return raw_data
 
 def generate_daily_news():
-    tz_tw = datetime.timezone(datetime.timedelta(hours=8))
-    today_str = datetime.datetime.now(tz_tw).strftime("%Y年%m月%d日")
-    now_full = datetime.datetime.now(tz_tw).strftime("%Y-%m-%d %H:%M")
+    now = datetime.datetime.now(TAIPEI)
+    today_str = now.strftime("%Y年%m月%d日")
+    now_full = now.strftime("%Y-%m-%d %H:%M")
 
-    # 1. 產業新聞（結合 Yahoo 附圖新聞 + Google News 過去24小時產業焦點）
-    industry = fetch_yahoo_news_with_images("https://tw.stock.yahoo.com/rss?category=research", max_items=2)
-    industry += fetch_google_news_rss("半導體 OR AI晶片 OR 科技產業 財經", max_items=3)
+    industry = fetch_yahoo_news_with_images(
+        "https://tw.stock.yahoo.com/rss?category=research", now, max_items=6
+    )
+    industry += fetch_google_news_rss("半導體 OR AI晶片 OR 科技產業 財經", now, max_items=6)
 
-    # 2. 股市總體動態
-    market_overview = fetch_yahoo_news_with_images("https://tw.stock.yahoo.com/rss?category=tw-market", max_items=2)
-    if not market_overview:
-        market_overview = fetch_google_news_rss("台股 加權指數 外資 投信", max_items=2)
+    market_overview = fetch_yahoo_news_with_images(
+        "https://tw.stock.yahoo.com/rss?category=tw-market", now, max_items=2
+    )
+    if len(market_overview) < 2:
+        market_overview += fetch_google_news_rss("台股 加權指數 外資 投信", now, max_items=4)
 
-    # 3. 台股重點個股觀察
-    focus_stocks = fetch_focus_stocks()
+    focus_stocks = fetch_focus_stocks(now)
 
-    # 4. 政治新聞
-    politics = fetch_yahoo_news_with_images("https://tw.news.yahoo.com/rss/politics", max_items=2)
-    politics += fetch_google_news_rss("台灣 政治 OR 國際外交 要聞", max_items=2)
+    politics = fetch_yahoo_news_with_images("https://tw.news.yahoo.com/rss/politics", now)
+    politics += fetch_google_news_rss("台灣 政治 OR 國際外交 要聞", now, max_items=4)
 
     data = {
-        "greeting": f"早安！為你整理今日（{today_str}）國內外重點產業、股市、台股焦點個股與政治新聞摘要：",
-        "industry": industry[:4],
-        "market_overview": market_overview[:2],
+        "greeting": f"為你整理截至 {today_str} 最近 48 小時的產業、股市、台股個股與政治新聞：",
+        "industry": select_news(industry, 4),
+        "market_overview": select_news(market_overview, 2),
         "focus_stocks": focus_stocks,
-        "politics": politics[:4],
+        "politics": select_news(politics, 4),
         "disclaimer": "以上市場觀察與焦點個股整理僅供資訊參考，不構成任何形式之投資建議與邀約，投資人應獨立審慎評估風險並自負盈虧。"
     }
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        cards = data["industry"] + data["market_overview"] + data["politics"]
+        cards += [item for item in focus_stocks if "published_at" in item]
+        list(executor.map(add_preview_image, cards))
 
     data = try_gemini_polish(data, today_str)
     return data, today_str, now_full
 
 def build_html(data, today_str, now_full):
+    def render_image(item, label):
+        url = item.get("image_url")
+        if not url:
+            return ""
+        return (
+            f'<div class="news-img"><img src="{escape(url)}" alt="{escape(label)}" '
+            'loading="lazy" onerror="this.parentElement.remove()"></div>'
+        )
+
+    def render_source(item):
+        link = item.get("source_url")
+        source = escape(item.get("source_name", "新聞來源"))
+        if not link:
+            return ""
+        return f'（<a href="{escape(link)}" target="_blank" rel="noopener noreferrer">{source}</a>）'
+
+    def render_date(item):
+        if not item.get("published_at"):
+            return ""
+        published = datetime.datetime.fromisoformat(item["published_at"]).astimezone(TAIPEI)
+        return (
+            f'<time datetime="{published.isoformat()}">'
+            f'{published:%Y-%m-%d %H:%M}（台灣時間）</time>'
+        )
+
     def render_news_items(items):
-        html = ""
-        for it in items:
-            img_html = ""
-            if it.get("image_url"):
-                img_html = f'<div class="news-img"><img src="{it["image_url"]}" alt="{it["title"]}" loading="lazy" onerror="this.parentElement.style.display=\'none\'"></div>'
-            link_html = f'（<a href="{it["source_url"]}" target="_blank" rel="noopener noreferrer">{it.get("source_name", "新聞來源")}</a>）' if it.get("source_url") else ""
-            html += f"""
+        if not items:
+            return "<p>目前沒有符合最近 48 小時條件的報導。</p>"
+        return "".join(f"""
             <article class="news-item">
-              {img_html}
+              {render_image(item, item["title"])}
               <div class="news-text">
-                <h3>{it['title']}</h3>
-                <p>{it['content']}{link_html}</p>
+                <h3>{escape(item["title"])}</h3>
+                {render_date(item)}
+                <p>{escape(item["content"])}{render_source(item)}</p>
               </div>
-            </article>"""
-        return html
+            </article>""" for item in items)
 
     def render_stock_items(items):
-        html = ""
-        for st in items:
-            link_html = f'（<a href="{st["source_url"]}" target="_blank" rel="noopener noreferrer">{st.get("source_name", "新聞來源")}</a>）' if st.get("source_url") else ""
-            html += f"""
+        return "".join(f"""
             <div class="stock-card">
-              <div class="stock-header">{st['code_and_name']}</div>
-              <p>{st['content']}{link_html}</p>
-            </div>"""
-        return html
+              <div class="stock-header">{escape(item["code_and_name"])}</div>
+              {render_image(item, item["code_and_name"])}
+              {render_date(item)}
+              <p>{escape(item["content"])}{render_source(item)}</p>
+            </div>""" for item in items)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -243,6 +366,8 @@ def build_html(data, today_str, now_full):
     .news-item:not(:has(.news-img)) {{ grid-template-columns: 1fr; }}
     @media (max-width: 680px) {{ .news-item {{ grid-template-columns: 1fr; }} }}
     .news-img img {{ width: 100%; height: 140px; object-fit: cover; border-radius: 8px; display: block; }}
+    time {{ display: block; margin: 0 0 5px; color: var(--mute); font-size: 13px; }}
+    .stock-card .news-img {{ margin: 8px 0; }}
     .news-text h3 {{ font-size: 17px; margin: 0 0 8px; color: var(--ink); }}
     .news-text p {{ font-size: 15px; margin: 0; color: var(--body); }}
     .stock-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }}
