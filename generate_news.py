@@ -146,62 +146,102 @@ def add_preview_image(item):
         pass
 
 
-# 抓取台灣證交所最新收盤價，自動結合個股最新新聞
-def fetch_focus_stocks(now):
-    twse_map = {}
+def fetch_stock_quotes(url, fields):
     try:
-        req = urllib.request.Request(
-            "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
-            headers={"User-Agent": "Mozilla/5.0"}
+        request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(request, timeout=15) as response:
+            rows = json.load(response)
+        code_key, name_key, close_key, change_key = fields
+        return {
+            row[code_key]: {
+                "name": row[name_key].strip(),
+                "close": row[close_key].strip(),
+                "change": row[change_key].strip(),
+                "date": row["Date"],
+            }
+            for row in rows
+            if re.fullmatch(r"[1-9][0-9]{3}", row[code_key])
+            and row[name_key].strip()
+        }
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(f"Stock quotes fetch warning for {url}: {error}")
+        return {}
+
+
+def rank_focus_stocks(quotes, articles):
+    if not quotes:
+        return []
+
+    # 優先比對較長的簡稱，避免「台積電」也算成「台積」。
+    names = {
+        quote["name"].replace("臺", "台"): code
+        for code, quote in quotes.items()
+        if len(quote["name"]) >= 2
+    }
+    alternatives = "|".join(map(re.escape, sorted(names, key=len, reverse=True)))
+    name_pattern = re.compile(alternatives) if alternatives else None
+    matched = {}
+    seen_titles = set()
+    for item in select_news(articles, len(articles) + 1):
+        title = item["title"].replace("臺", "台")
+        title_key = re.sub(r"[\W_]+", "", title).casefold()
+        if title_key in seen_titles:
+            continue
+        seen_titles.add(title_key)
+        codes = {names[name] for name in name_pattern.findall(title)} if name_pattern else set()
+        codes.update(
+            code for code in re.findall(r"[（(]([1-9][0-9]{3})[）)]", title)
+            if code in quotes
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            for row in json.loads(resp.read().decode("utf-8")):
-                code = row.get("Code", "").strip()
-                if len(code) == 4 and code.isdigit():
-                    twse_map[code] = {
-                        "name": row.get("Name", "").strip(),
-                        "close": row.get("ClosingPrice", "-"),
-                        "change": row.get("Change", "0"),
-                        "val": float(row.get("TradeValue", "0").replace(",", "") or 0)
-                    }
-    except Exception as e:
-        print(f"TWSE fetch warning: {e}")
+        for code in codes:
+            matched.setdefault(code, []).append(item)
 
-    # 預設核心權值股 + 自動挑出當日成交值最高的前幾名熱門股
-    base_codes = [("2330", "台積電"), ("2317", "鴻海"), ("2382", "廣達"), ("2454", "聯發科")]
-    seen = {c for c, _ in base_codes}
-    top_traded = sorted(twse_map.items(), key=lambda x: x[1]["val"], reverse=True)
-    for code, info in top_traded:
-        if not code.startswith("00") and code not in seen and len(base_codes) < 6:
-            base_codes.append((code, info["name"]))
-            seen.add(code)
+    ranked = sorted(matched, key=lambda code: (
+        -len(matched[code]),
+        -datetime.datetime.fromisoformat(matched[code][0]["published_at"]).timestamp(),
+        code,
+    ))
+    cards = []
+    for code in ranked[:8]:
+        quote = quotes[code]
+        price = ""
+        if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", quote["close"]):
+            date = quote["date"]
+            trading_day = f"{int(date[:-4]) + 1911}-{date[-4:-2]}-{date[-2:]}" if date.isdigit() and len(date) == 7 else date
+            price = f"{trading_day} 收盤 {quote['close']} 元｜漲跌 {quote['change']}"
+        cards.append({
+            "code_and_name": f"{code} {quote['name']}",
+            "price": price,
+            "article_count": len(matched[code]),
+            "articles": matched[code][:3],
+        })
+    return cards
 
-    stock_cards = []
-    for code, name in base_codes:
-        news_list = fetch_google_news_rss(f"{code} {name} 營收 OR 法人 OR 財報", now, max_items=2)
-        price_str = ""
-        if code in twse_map:
-            c_info = twse_map[code]
-            price_str = f"【最新收盤：{c_info['close']} 元｜漲跌：{c_info['change']}】"
-        if news_list:
-            top_n = news_list[0]
-            second_title = f"；另市場關注「{news_list[1]['title']}」" if len(news_list) > 1 else ""
-            stock_cards.append({
-                "code_and_name": f"{code} {name}",
-                "content": f"{price_str}{top_n['title']}{second_title}。",
-                "source_name": top_n["source_name"],
-                "source_url": top_n["source_url"],
-                "image_url": top_n["image_url"],
-                "published_at": top_n["published_at"]
-            })
-        else:
-            stock_cards.append({
-                "code_and_name": f"{code} {name}",
-                "content": f"{price_str}持續追蹤近期營收財報與三大法人籌碼動向。",
-                "source_name": "臺灣證券交易所",
-                "source_url": "https://www.twse.com.tw/"
-            })
-    return stock_cards
+
+def fetch_focus_stocks(now):
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        listed = executor.submit(
+            fetch_stock_quotes, "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL",
+            ("Code", "Name", "ClosingPrice", "Change"),
+        )
+        otc = executor.submit(
+            fetch_stock_quotes, "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_daily_close_quotes",
+            ("SecuritiesCompanyCode", "CompanyName", "Close", "Change"),
+        )
+        feeds = [
+            executor.submit(fetch_yahoo_news_with_images,
+                            "https://tw.stock.yahoo.com/rss?category=tw-market", now, 100),
+            executor.submit(fetch_google_news_rss, "台股 個股", now, 100),
+            executor.submit(fetch_google_news_rss, "台股 上市 OR 上櫃", now, 100),
+        ]
+        quotes = {**listed.result(), **otc.result()}
+        articles = [item for feed in feeds for item in feed.result()]
+
+    coverage = "上市、上櫃" if listed.result() and otc.result() else (
+        "上市" if listed.result() else "上櫃" if otc.result() else ""
+    )
+    return rank_focus_stocks(quotes, articles), coverage
+
 
 # 若 Gemini API 可用則協助潤飾摘要；若遇 429 額度限制或型號停用則自動使用抓好的新聞，絕不報錯中斷！
 def try_gemini_polish(raw_data, today_str):
@@ -220,7 +260,7 @@ def try_gemini_polish(raw_data, today_str):
                 resp = client.models.generate_content(model=model_name, contents=prompt)
                 txt = re.sub(r"^```json\s*|\s*```$", "", resp.text.strip())
                 polished = json.loads(txt)
-                for section in ("industry", "market_overview", "focus_stocks", "politics"):
+                for section in ("industry", "market_overview", "politics"):
                     original_items = raw_data[section]
                     revised_items = polished[section]
                     if len(original_items) != len(revised_items):
@@ -257,7 +297,7 @@ def generate_daily_news():
     if len(market_overview) < 2:
         market_overview += fetch_google_news_rss("台股 加權指數 外資 投信", now, max_items=4)
 
-    focus_stocks = fetch_focus_stocks(now)
+    focus_stocks, stock_coverage = fetch_focus_stocks(now)
 
     politics = fetch_yahoo_news_with_images("https://tw.news.yahoo.com/rss/politics", now)
     politics += fetch_google_news_rss("台灣 政治 OR 國際外交 要聞", now, max_items=4)
@@ -267,13 +307,14 @@ def generate_daily_news():
         "industry": select_news(industry, 4),
         "market_overview": select_news(market_overview, 2),
         "focus_stocks": focus_stocks,
+        "stock_coverage": stock_coverage,
         "politics": select_news(politics, 4),
         "disclaimer": "以上市場觀察與焦點個股整理僅供資訊參考，不構成任何形式之投資建議與邀約，投資人應獨立審慎評估風險並自負盈虧。"
     }
 
     with ThreadPoolExecutor(max_workers=6) as executor:
         cards = data["industry"] + data["market_overview"] + data["politics"]
-        cards += [item for item in focus_stocks if "published_at" in item]
+        cards += [item["articles"][0] for item in focus_stocks]
         list(executor.map(add_preview_image, cards))
 
     data = try_gemini_polish(data, today_str)
@@ -319,13 +360,26 @@ def build_html(data, today_str, now_full):
             </article>""" for item in items)
 
     def render_stock_items(items):
-        return "".join(f"""
+        if not items:
+            return "<p>目前沒有可配對的近 48 小時個股新聞。</p>"
+        cards = []
+        for item in items:
+            links = "".join(
+                f'<li><a href="{escape(article["source_url"])}" target="_blank" '
+                f'rel="noopener noreferrer">{escape(article["title"])}</a> '
+                f'（{escape(article["source_name"])}）{render_date(article)}</li>'
+                for article in item["articles"]
+            )
+            price = f'<p>{escape(item["price"])}</p>' if item["price"] else ""
+            cards.append(f"""
             <div class="stock-card">
               <div class="stock-header">{escape(item["code_and_name"])}</div>
-              {render_image(item, item["code_and_name"])}
-              {render_date(item)}
-              <p>{escape(item["content"])}{render_source(item)}</p>
-            </div>""" for item in items)
+              <p>近 48 小時 {item["article_count"]} 則相關報導</p>
+              {price}
+              {render_image(item["articles"][0], item["code_and_name"])}
+              <ul>{links}</ul>
+            </div>""")
+        return "".join(cards)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-Hant">
@@ -376,6 +430,9 @@ def build_html(data, today_str, now_full):
       display: inline-block; background: var(--tag-bg); color: var(--accent);
       font-weight: 700; font-size: 16px; padding: 4px 12px; border-radius: 6px; margin-bottom: 10px;
     }}
+    .stock-card ul {{ padding-inline-start: 1.2em; margin: 10px 0 0; }}
+    .stock-card li + li {{ margin-top: 8px; }}
+    .stock-card time {{ display: block; }}
     .stock-card p {{ font-size: 15px; margin: 0; color: var(--body); }}
     a {{ color: var(--accent); text-decoration: none; font-weight: 500; }}
     a:hover {{ text-decoration: underline; }}
@@ -401,6 +458,7 @@ def build_html(data, today_str, now_full):
     <div class="news-list">{render_news_items(data.get('market_overview', []))}</div>
 
     <div class="sub-label">重點個股觀察：</div>
+    <p>依近 48 小時 Yahoo 奇摩股市與 Google 新聞收錄的去重報導篇數排名。涵蓋：{escape(data.get("stock_coverage") or "暫無股票資料")}。</p>
     <div class="stock-grid">{render_stock_items(data.get('focus_stocks', []))}</div>
 
     <h2>三、 政治新聞</h2>
